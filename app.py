@@ -22,6 +22,7 @@ SHOW_CONSOLE_LOGS = True
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 RESPONSES_DIR = os.path.join(BASE_DIR, "responses")
+REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 
 
 # =======================================
@@ -679,6 +680,456 @@ class HumanUAAuth:
         )
         return stats
 
+    def _get_semester_container_id_for_class(self, class_id: int, semester_number: int) -> Optional[int]:
+        """Получает container id для указанного семестра и класса."""
+        if self.user_id is None:
+            self.logger.error("user_id не установлен. Невозможно получить semester container id.")
+            return None
+
+        url = f"{self.api_url}/{self.user_id}/plan/summative-assessment-container/result-group/course/{class_id}"
+        self.logger.info(
+            f"Запрос container для класса {class_id}, semester={semester_number}: {url}"
+        )
+        try:
+            response = self.session.get(url, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                self.logger.error(
+                    f"Некорректный формат container-ответа для класса {class_id}: {type(payload).__name__}"
+                )
+                return None
+
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                item_semester = self._parse_int(item.get("semester_number"))
+                if item_semester != semester_number:
+                    continue
+                semestr_id = self._parse_int(item.get("id"))
+                if semestr_id is not None:
+                    self.logger.info(
+                        f"Для класса {class_id} найден semestr_id={semestr_id} (semester={semester_number})"
+                    )
+                    return semestr_id
+
+            self.logger.warning(
+                f"Для класса {class_id} не найден container с semester_number={semester_number}"
+            )
+            return None
+        except requests.RequestException as e:
+            self.logger.error(f"Ошибка запроса container для класса {class_id}: {e}")
+            return None
+        except requests.exceptions.JSONDecodeError:
+            self.logger.error(f"Ответ container для класса {class_id} не JSON")
+            return None
+
+    def _extract_result_groups_for_student(self, semestr_id: int, student_id: int) -> List[Dict[str, Any]]:
+        """Получает result_groups по ученику и семестровому контейнеру."""
+        if self.user_id is None:
+            self.logger.error("user_id не установлен. Невозможно получить result_groups ученика.")
+            return []
+
+        url = (
+            f"{self.api_url}/{self.user_id}/plan/summative-assessment-container/result-group/"
+            f"{semestr_id}/student/{student_id}"
+        )
+        self.logger.info(
+            f"Запрос result_groups для student_id={student_id}, semestr_id={semestr_id}: {url}"
+        )
+
+        try:
+            response = self.session.get(url, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                self.logger.error(
+                    f"Некорректный формат student-result ответа для student_id={student_id}: {type(payload).__name__}"
+                )
+                return []
+
+            data_items = payload.get("data")
+            if not isinstance(data_items, list):
+                self.logger.warning(f"student_id={student_id}: поле data отсутствует или не list")
+                return []
+
+            result_groups_flat: List[Dict[str, Any]] = []
+            for data_idx, data_item in enumerate(data_items):
+                if not isinstance(data_item, dict):
+                    self.logger.debug(f"student_id={student_id}: data[{data_idx}] пропущен (не dict)")
+                    continue
+                groups = data_item.get("result_groups")
+                if not isinstance(groups, list):
+                    self.logger.debug(f"student_id={student_id}: result_groups в data[{data_idx}] не list")
+                    continue
+                for group_idx, group in enumerate(groups):
+                    if isinstance(group, dict):
+                        result_groups_flat.append(group)
+                    else:
+                        self.logger.debug(
+                            f"student_id={student_id}: result_groups[{group_idx}] в data[{data_idx}] не dict"
+                        )
+
+            self.logger.info(
+                f"student_id={student_id}: получено групп результатов: {len(result_groups_flat)}"
+            )
+            return result_groups_flat
+        except requests.RequestException as e:
+            self.logger.error(
+                f"Ошибка запроса student-result для student_id={student_id}, semestr_id={semestr_id}: {e}"
+            )
+            return []
+        except requests.exceptions.JSONDecodeError:
+            self.logger.error(
+                f"Ответ student-result не JSON для student_id={student_id}, semestr_id={semestr_id}"
+            )
+            return []
+
+    def _post_result_group_assessment(
+        self,
+        semestr_id: int,
+        student_id: int,
+        result_group_id: int,
+        average_score: Any,
+    ) -> bool:
+        """Отправляет один POST на создание/обновление оценки группы результата."""
+        if self.user_id is None:
+            self.logger.error("user_id не установлен. Невозможно отправить result-group assessment.")
+            return False
+
+        endpoint_path = f"/{self.user_id}/plan/summative-assessment/result-group/assessment"
+        url = f"{self.api_url}{endpoint_path}"
+
+        payload = {
+            "endpoint": endpoint_path,
+            "entity_type": 12,
+            "grade": 3,
+            "int_value": average_score,
+            "is_final": 1,
+            "learner_id": student_id,
+            "result_group_id": result_group_id,
+            "summative_assessment_container_id": semestr_id,
+            "type": 0,
+        }
+
+        self.logger.debug(
+            "POST result-group assessment payload: "
+            f"student_id={student_id}, semestr_id={semestr_id}, result_group_id={result_group_id}, "
+            f"int_value={average_score}"
+        )
+
+        try:
+            response = self.session.post(url, data=json.dumps(payload), timeout=20)
+            response.raise_for_status()
+            self.logger.info(
+                f"Успех POST assessment: student_id={student_id}, result_group_id={result_group_id}, status={response.status_code}"
+            )
+            return True
+        except requests.RequestException as e:
+            self.logger.error(
+                "Ошибка POST assessment: "
+                f"student_id={student_id}, result_group_id={result_group_id}, semestr_id={semestr_id}, error={e}"
+            )
+            return False
+
+    def _round_score_to_int(self, value: Any) -> Optional[int]:
+        """Преобразует score в int с округлением до ближайшего целого (half-up для .5)."""
+        if value is None:
+            return None
+
+        try:
+            numeric = float(str(value).replace(",", "."))
+        except (TypeError, ValueError):
+            return None
+
+        if numeric >= 0:
+            return int(numeric + 0.5)
+        return int(numeric - 0.5)
+
+    def _save_failed_students_report(self, failed_students: List[Dict[str, Any]]) -> Optional[str]:
+        """Сохраняет CSV-отчет по ученикам, у которых не удалось проставить оценки полностью."""
+        if not failed_students:
+            return None
+
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        file_path = os.path.join(REPORTS_DIR, f"failed_result_group_students_{timestamp}.csv")
+        fieldnames = [
+            "class_id",
+            "semestr_id",
+            "semester_number",
+            "student_id",
+            "mode",
+            "failed_posts",
+            "reasons",
+        ]
+
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in failed_students:
+                    writer.writerow(row)
+                csvfile.flush()
+                os.fsync(csvfile.fileno())
+            self.logger.info(f"Отчет по проблемным ученикам сохранен: {file_path}")
+            return file_path
+        except Exception as e:
+            self.logger.error(f"Не удалось сохранить отчет по проблемным ученикам: {e}")
+            return None
+
+    def set_result_groups_for_selected_classes(
+        self,
+        semester_number: int,
+        dry_run: bool = False,
+        score_mode: str = "max",
+    ) -> Dict[str, Any]:
+        """Проставляет result-group оценки для учеников выбранных классов (или всех, если фильтр не задан)."""
+        stats = {
+            "total_classes": 0,
+            "processed_classes": 0,
+            "students_total": 0,
+            "students_processed": 0,
+            "students_with_failures": 0,
+            "posts_sent": 0,
+            "posts_failed": 0,
+            "posts_planned": 0,
+            "skipped_classes": 0,
+            "errors": 0,
+            "failed_students_report": None,
+            "score_mode": score_mode,
+        }
+
+        failed_students: List[Dict[str, Any]] = []
+
+        if self.user_id is None:
+            self.logger.error("user_id не установлен. Операция невозможна.")
+            stats["errors"] += 1
+            return stats
+
+        if score_mode not in {"max", "individual"}:
+            self.logger.error(f"Некорректный score_mode='{score_mode}'. Доступно: max или individual.")
+            stats["errors"] += 1
+            return stats
+
+        classes = self.get_all_classes()
+        if classes is None:
+            self.logger.error("Не удалось получить список классов для проставления result-group.")
+            stats["errors"] += 1
+            return stats
+
+        filtered_classes = self._apply_selected_classes_filter(classes)
+        stats["total_classes"] = len(filtered_classes)
+        if not filtered_classes:
+            self.logger.warning("После применения фильтра классов список пуст. Нечего обрабатывать.")
+            return stats
+
+        self.logger.info(
+            f"Старт проставления result-group: semester={semester_number}, classes={len(filtered_classes)}, "
+            f"dry_run={dry_run}, score_mode={score_mode}"
+        )
+
+        for idx, cls in enumerate(filtered_classes, start=1):
+            class_id = self._parse_int(cls.get("id"))
+            class_name = str(cls.get("name", "Без названия"))
+            class_number = str(cls.get("number", "-"))
+            prefix = f"[{idx}/{len(filtered_classes)}]"
+
+            self.logger.info(
+                f"{prefix} Класс: id={class_id}, number='{class_number}', name='{class_name}', semester={semester_number}"
+            )
+
+            try:
+                if class_id is None:
+                    self.logger.warning(f"{prefix} Пропуск класса: невалидный class_id")
+                    stats["skipped_classes"] += 1
+                    continue
+
+                semestr_id = self._get_semester_container_id_for_class(class_id, semester_number)
+                if semestr_id is None:
+                    self.logger.warning(f"{prefix} Пропуск класса {class_id}: не найден semestr_id")
+                    stats["skipped_classes"] += 1
+                    continue
+
+                members = self.get_class_members(class_id)
+                if members is None:
+                    self.logger.warning(f"{prefix} Пропуск класса {class_id}: не удалось получить участников")
+                    stats["errors"] += 1
+                    continue
+
+                # Берем только учеников (group_role_id=5) с валидным user_id.
+                students: List[int] = []
+                for member in members:
+                    if not isinstance(member, dict):
+                        continue
+                    role_id = self._parse_int(member.get("group_role_id"))
+                    student_id = self._parse_int(member.get("user_id"))
+                    if role_id == 5 and student_id is not None:
+                        students.append(student_id)
+
+                unique_students = sorted(set(students))
+                self.logger.info(
+                    f"{prefix} class_id={class_id}: найдено учеников для обработки={len(unique_students)}"
+                )
+                stats["students_total"] += len(unique_students)
+                stats["processed_classes"] += 1
+
+                total_students_in_class = len(unique_students)
+                for student_index, student_id in enumerate(unique_students, start=1):
+                    student_prefix = f"{prefix} [{student_index}/{total_students_in_class}]"
+                    try:
+                        student_reasons: List[str] = []
+                        student_failed_posts = 0
+
+                        self.logger.info(
+                            f"{student_prefix} Обработка ученика student_id={student_id}"
+                        )
+
+                        result_groups = self._extract_result_groups_for_student(semestr_id, student_id)
+                        if not result_groups:
+                            self.logger.warning(
+                                f"{student_prefix} student_id={student_id}: result_groups пуст, пропуск ученика"
+                            )
+                            student_reasons.append("result_groups пуст")
+                            failed_students.append({
+                                "class_id": class_id,
+                                "semestr_id": semestr_id,
+                                "semester_number": semester_number,
+                                "student_id": student_id,
+                                "mode": score_mode,
+                                "failed_posts": 0,
+                                "reasons": "; ".join(student_reasons),
+                            })
+                            stats["students_with_failures"] += 1
+                            continue
+
+                        stats["students_processed"] += 1
+
+                        max_score: Optional[int] = None
+                        if score_mode == "max":
+                            score_candidates: List[int] = []
+                            for group in result_groups:
+                                rounded_score = self._round_score_to_int(group.get("average_score"))
+                                if rounded_score is not None:
+                                    score_candidates.append(rounded_score)
+
+                            if not score_candidates:
+                                self.logger.warning(
+                                    f"{student_prefix} student_id={student_id}: не найдено валидных average_score, "
+                                    "пропуск ученика"
+                                )
+                                student_reasons.append("нет валидных average_score")
+                                failed_students.append({
+                                    "class_id": class_id,
+                                    "semestr_id": semestr_id,
+                                    "semester_number": semester_number,
+                                    "student_id": student_id,
+                                    "mode": score_mode,
+                                    "failed_posts": 0,
+                                    "reasons": "; ".join(student_reasons),
+                                })
+                                stats["students_with_failures"] += 1
+                                continue
+
+                            max_score = max(score_candidates)
+                            self.logger.info(
+                                f"{student_prefix} student_id={student_id}: выбран максимальный average_score={max_score}; "
+                                "будет использован для всех POST по result_groups"
+                            )
+
+                        for group in result_groups:
+                            result_group_id = self._parse_int(group.get("result_group_id"))
+                            if result_group_id is None:
+                                self.logger.warning(
+                                    f"{student_prefix} student_id={student_id}: пропуск result_group без result_group_id"
+                                )
+                                stats["posts_failed"] += 1
+                                student_failed_posts += 1
+                                student_reasons.append("result_group без result_group_id")
+                                continue
+
+                            if score_mode == "max":
+                                score_to_send = max_score
+                            else:
+                                score_to_send = self._round_score_to_int(group.get("average_score"))
+                                if score_to_send is None:
+                                    self.logger.warning(
+                                        f"{student_prefix} student_id={student_id}: невалидный average_score "
+                                        f"для result_group_id={result_group_id}"
+                                    )
+                                    stats["posts_failed"] += 1
+                                    student_failed_posts += 1
+                                    student_reasons.append(
+                                        f"invalid average_score result_group_id={result_group_id}"
+                                    )
+                                    continue
+
+                            stats["posts_planned"] += 1
+
+                            if dry_run:
+                                self.logger.info(
+                                    f"{student_prefix} DRY-RUN: student_id={student_id}, "
+                                    f"result_group_id={result_group_id}, int_value={score_to_send}"
+                                )
+                                continue
+
+                            ok = self._post_result_group_assessment(
+                                semestr_id=semestr_id,
+                                student_id=student_id,
+                                result_group_id=result_group_id,
+                                average_score=score_to_send,
+                            )
+                            if ok:
+                                stats["posts_sent"] += 1
+                            else:
+                                stats["posts_failed"] += 1
+                                student_failed_posts += 1
+                                student_reasons.append(f"POST failed result_group_id={result_group_id}")
+
+                        if student_failed_posts > 0:
+                            failed_students.append({
+                                "class_id": class_id,
+                                "semestr_id": semestr_id,
+                                "semester_number": semester_number,
+                                "student_id": student_id,
+                                "mode": score_mode,
+                                "failed_posts": student_failed_posts,
+                                "reasons": "; ".join(sorted(set(student_reasons))) if student_reasons else "unknown",
+                            })
+                            stats["students_with_failures"] += 1
+                    except Exception as e:
+                        self.logger.error(
+                            f"{student_prefix} Непредвиденная ошибка при обработке student_id={student_id}: {e}"
+                        )
+                        failed_students.append({
+                            "class_id": class_id,
+                            "semestr_id": semestr_id,
+                            "semester_number": semester_number,
+                            "student_id": student_id,
+                            "mode": score_mode,
+                            "failed_posts": 0,
+                            "reasons": f"exception: {e}",
+                        })
+                        stats["students_with_failures"] += 1
+                        stats["errors"] += 1
+            except Exception as e:
+                self.logger.error(f"{prefix} Непредвиденная ошибка при обработке класса: {e}")
+                stats["errors"] += 1
+
+        report_path = self._save_failed_students_report(failed_students)
+        stats["failed_students_report"] = report_path
+
+        self.logger.info(
+            "Итог проставления result-group: "
+            f"total_classes={stats['total_classes']}, processed_classes={stats['processed_classes']}, "
+            f"students_total={stats['students_total']}, students_processed={stats['students_processed']}, "
+            f"students_with_failures={stats['students_with_failures']}, posts_planned={stats['posts_planned']}, "
+            f"posts_sent={stats['posts_sent']}, posts_failed={stats['posts_failed']}, "
+            f"skipped_classes={stats['skipped_classes']}, errors={stats['errors']}, "
+            f"score_mode={stats['score_mode']}, report={report_path}"
+        )
+        return stats
+
     def toggle_request_dumping(self) -> bool:
         """Переключает режим автосохранения всех ответов API в файлы."""
         self.save_all_responses_enabled = not self.save_all_responses_enabled
@@ -904,6 +1355,7 @@ def print_menu(is_autosave_enabled: bool, selected_classes_status: str) -> None:
     print("5) Показать список участников класса")
     print("6) Экспортировать всех учеников в CSV")
     print("7) Создать компетенции")
+    print("8) Проставить группы результатов")
     print("0) Выход")
 
 
@@ -1043,6 +1495,49 @@ def run_cli_menu(auth_service: HumanUAAuth) -> None:
                 f"total={stats['total']}, processed={stats['processed']}, created={stats['created']}, "
                 f"skipped={stats['skipped']}, errors={stats['errors']}"
             )
+            continue
+
+        if choice == "8":
+            semester_raw = input("Выберите семестр (1 или 2): ").strip()
+            if semester_raw not in {"1", "2"}:
+                print("Некорректный семестр. Доступно: 1 или 2.")
+                continue
+
+            score_mode_raw = input(
+                "Режим оценки: 1 - максимум (одно значение на все группы), "
+                "2 - индивидуально (по average_score каждой группы) [1]: "
+            ).strip()
+            if score_mode_raw in {"", "1"}:
+                score_mode = "max"
+            elif score_mode_raw == "2":
+                score_mode = "individual"
+            else:
+                print("Некорректный режим. Доступно: 1 или 2.")
+                continue
+
+            dry_run_raw = input("Тестовый режим без отправки POST? (y/N): ").strip().lower()
+            dry_run = dry_run_raw in {"y", "yes", "д", "да"}
+
+            semester_number = int(semester_raw)
+            print(
+                f"Запускаю проставление групп результатов для семестра {semester_number}. "
+                "Подробности в логах..."
+            )
+            stats = auth_service.set_result_groups_for_selected_classes(
+                semester_number=semester_number,
+                dry_run=dry_run,
+                score_mode=score_mode,
+            )
+            print(
+                "Готово: "
+                f"classes={stats['processed_classes']}/{stats['total_classes']}, "
+                f"students={stats['students_processed']}/{stats['students_total']}, "
+                f"students_with_failures={stats['students_with_failures']}, "
+                f"posts_planned={stats['posts_planned']}, posts_ok={stats['posts_sent']}, posts_failed={stats['posts_failed']}, "
+                f"skipped_classes={stats['skipped_classes']}, errors={stats['errors']}, mode={stats['score_mode']}"
+            )
+            if stats.get("failed_students_report"):
+                print(f"Отчет по проблемным ученикам: {stats['failed_students_report']}")
             continue
 
         print("Неизвестная опция, попробуйте снова.")
