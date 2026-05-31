@@ -4,9 +4,10 @@ import json
 import csv
 import os
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 import re
 import time
+from urllib.parse import urlparse
 
 # ============== НАСТРОЙКИ ==============
 # Замените эти значения на ваши данные для входа.
@@ -42,6 +43,9 @@ class HumanUAAuth:
         self.user_id: Optional[int] = None
         self.global_user_id: Optional[int] = None
         self.academic_year_id: Optional[int] = None
+        self.selected_class_ids: Optional[Set[int]] = None
+        self.save_all_responses_enabled: bool = False
+        self._response_dump_seq: int = 0
         self._setup_logging()
         self._configure_session()
 
@@ -134,6 +138,7 @@ class HumanUAAuth:
             'Connection': 'keep-alive',
             'Content-Type': 'application/json;charset=UTF-8'
         })
+        self.session.hooks['response'].append(self._response_dump_hook)
         self.logger.info("Сессия HTTP настроена.")
 
     def login(self) -> bool:
@@ -365,55 +370,381 @@ class HumanUAAuth:
         """Очистка имени файла от недопустимых символов."""
         return re.sub(r'[\\/:*?"<>|]', '_', filename)
 
-    def save_json_response(self, endpoint_input: str) -> Optional[str]:
-        """
-        Сохраняет JSON-ответ API по введенному URL или пути.
-        Возвращает путь к файлу при успехе, иначе None.
-        """
-        raw_value = endpoint_input.strip()
-        if not raw_value:
-            self.logger.error("Пустой адрес запроса.")
+    def _extract_subject_name(self, cls: Dict[str, Any]) -> str:
+        """Безопасно извлекает название предмета класса."""
+        subject = cls.get('subject')
+        if isinstance(subject, dict):
+            i18n = subject.get('i18n')
+            if isinstance(i18n, dict):
+                name = i18n.get('name')
+                if isinstance(name, str):
+                    return name
+        return "-"
+
+    def _normalize_name_for_match(self, value: Any) -> str:
+        """Нормализует строку для устойчивого сравнения названий предметов/галузей."""
+        if value is None:
+            return ""
+
+        text = str(value).strip().lower()
+        if not text:
+            return ""
+
+        replacements = {
+            '«': ' ',
+            '»': ' ',
+            '“': ' ',
+            '”': ' ',
+            '"': ' ',
+            '„': ' ',
+            'ʼ': '',
+            '’': '',
+            "'": '',
+            '`': '',
+            '՚': '',
+            '‘': '',
+            '–': ' ',
+            '—': ' ',
+            '-': ' ',
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+
+        text = text.replace('ё', 'е')
+        text = re.sub(r'[^0-9a-zа-яіїєґ\s]', ' ', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    def _match_score(self, left: str, right: str) -> float:
+        """Считает score совпадения двух уже нормализованных строк [0..1]."""
+        if not left or not right:
+            return 0.0
+        if left == right:
+            return 1.0
+        if left in right or right in left:
+            return 0.9
+
+        left_tokens: Set[str] = set(left.split())
+        right_tokens: Set[str] = set(right.split())
+        if not left_tokens or not right_tokens:
+            return 0.0
+
+        inter = left_tokens & right_tokens
+        if not inter:
+            return 0.0
+
+        return len(inter) / max(1, min(len(left_tokens), len(right_tokens)))
+
+    def _pick_industry_id_by_subject(self, industries: Any, class_subject_name: str) -> Optional[int]:
+        """Выбирает industry_id по максимально похожему имени предмета."""
+        if not isinstance(industries, list):
+            self.logger.error(f"Ожидался список industries, но получено: {type(industries).__name__}")
             return None
 
-        if raw_value.startswith("http://") or raw_value.startswith("https://"):
-            url = raw_value
-            endpoint_for_name = raw_value.replace("https://", "").replace("http://", "")
-        else:
-            endpoint_path = raw_value if raw_value.startswith("/") else f"/{raw_value}"
-            url = f"{self.api_url}{endpoint_path}"
-            endpoint_for_name = endpoint_path.strip("/")
+        target_norm = self._normalize_name_for_match(class_subject_name)
+        if not target_norm or target_norm == '-':
+            self.logger.warning(f"Пустое/невалидное название предмета класса: '{class_subject_name}'")
+            return None
 
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        safe_name = self._sanitize_filename(endpoint_for_name or "root")
-        os.makedirs(RESPONSES_DIR, exist_ok=True)
-        file_path = os.path.join(RESPONSES_DIR, f"{timestamp}_{safe_name}.json")
+        self.logger.debug(f"Сопоставление industry по предмету: raw='{class_subject_name}', normalized='{target_norm}'")
 
-        self.logger.info(f"Запрос для сохранения JSON: {url}")
-        response: Optional[requests.Response] = None
+        best_score = 0.0
+        best_id: Optional[int] = None
+        best_name = ""
+
+        for idx, item in enumerate(industries):
+            if not isinstance(item, dict):
+                self.logger.debug(f"industries[{idx}] пропущен: тип {type(item).__name__}")
+                continue
+
+            industry_id = self._parse_int(item.get('id'))
+            industry_name_raw = item.get('name', '')
+            industry_name_norm = self._normalize_name_for_match(industry_name_raw)
+            score = self._match_score(target_norm, industry_name_norm)
+
+            self.logger.debug(
+                f"industries[{idx}] id={industry_id}, name='{industry_name_raw}', normalized='{industry_name_norm}', score={score:.3f}"
+            )
+
+            if industry_id is None:
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_id = industry_id
+                best_name = str(industry_name_raw)
+
+        # Порог 0.6: обычно достаточно для устойчивого частичного совпадения.
+        if best_id is not None and best_score >= 0.6:
+            self.logger.info(
+                f"Выбран industry_id={best_id} по предмету '{class_subject_name}' -> '{best_name}' (score={best_score:.3f})"
+            )
+            return best_id
+
+        self.logger.warning(
+            f"Не удалось подобрать industry_id для предмета '{class_subject_name}'. Лучший score={best_score:.3f}, id={best_id}"
+        )
+        return None
+
+    def _normalize_report_date(self, input_date: str) -> Optional[str]:
+        """Проверяет/нормализует дату отчета к формату YYYY-MM-DD HH:MM:SS."""
+        raw = input_date.strip()
+        if not raw:
+            return None
+
+        formats = [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d",
+        ]
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(raw, fmt)
+                if fmt == "%Y-%m-%d":
+                    dt = dt.replace(hour=0, minute=0, second=0)
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+
+        return None
+
+    def get_selected_classes_status(self) -> str:
+        """Текстовый статус текущего выбора классов для массовых операций."""
+        if not self.selected_class_ids:
+            return "ВСЕ"
+        return f"ВЫБРАНО: {len(self.selected_class_ids)}"
+
+    def set_selected_class_ids(self, class_ids: Optional[Set[int]]) -> None:
+        """Устанавливает список выбранных class_id (None/empty = все классы)."""
+        if not class_ids:
+            self.selected_class_ids = None
+            self.logger.info("Фильтр классов сброшен: будут использованы все классы.")
+            return
+
+        selected_ids = set(class_ids)
+        self.selected_class_ids = selected_ids
+        selected_str = ", ".join(str(x) for x in sorted(selected_ids))
+        self.logger.info(f"Установлен фильтр классов: {selected_str}")
+
+    def _apply_selected_classes_filter(self, classes_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Фильтрует список классов по выбранным class_id."""
+        if not self.selected_class_ids:
+            self.logger.info("Фильтр классов не задан: используются все классы.")
+            return classes_list
+
+        selected = self.selected_class_ids
+        filtered: List[Dict[str, Any]] = []
+        for cls in classes_list:
+            class_id = self._parse_int(cls.get('id'))
+            if class_id is not None and class_id in selected:
+                filtered.append(cls)
+
+        self.logger.info(
+            f"Применен фильтр классов: выбрано={len(selected)}, найдено в текущем списке={len(filtered)}"
+        )
+        return filtered
+
+    def _get_industries_for_class(self, class_id: int) -> Optional[List[Dict[str, Any]]]:
+        """Получает industries для конкретного класса."""
+        if self.user_id is None:
+            self.logger.error("user_id не установлен. Невозможно запросить industries.")
+            return None
+
+        url = f"{self.api_url}/{self.user_id}/plan/competence-reports-course/{class_id}/industries"
+        params = {"expand": "competenceKit.academicYear"}
+        self.logger.info(f"Запрос industries для класса {class_id}: {url}")
+
         try:
-            response = self.session.get(url, timeout=20)
+            response = self.session.get(url, params=params, timeout=20)
             response.raise_for_status()
-            payload = response.json()
+            data = response.json()
+            if not isinstance(data, list):
+                self.logger.error(f"Некорректный формат industries для класса {class_id}: {type(data).__name__}")
+                return None
+            self.logger.info(f"Получено industries для класса {class_id}: {len(data)} шт.")
+            return data
+        except requests.RequestException as e:
+            self.logger.error(f"Ошибка запроса industries для класса {class_id}: {e}")
+            return None
+        except requests.exceptions.JSONDecodeError:
+            self.logger.error(f"Ответ industries для класса {class_id} не JSON")
+            return None
 
+    def create_competences_for_all_classes(self, competence_name: str, report_date: str) -> Dict[str, int]:
+        """Создает компетенции по всем классам с подробным логированием и устойчивостью к ошибкам."""
+        stats = {
+            "total": 0,
+            "processed": 0,
+            "created": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+
+        if not self.user_id:
+            self.logger.error("user_id не установлен. Создание компетенций невозможно.")
+            stats["errors"] += 1
+            return stats
+
+        classes = self.get_all_classes()
+        if classes is None:
+            self.logger.error("Не удалось получить список классов для создания компетенций.")
+            stats["errors"] += 1
+            return stats
+
+        filtered_classes = self._apply_selected_classes_filter(classes)
+        stats["total"] = len(filtered_classes)
+        if not filtered_classes:
+            self.logger.warning("После применения фильтра классов список пуст. Нечего обрабатывать.")
+            return stats
+
+        self.logger.info(
+            f"Старт массового создания компетенций: классов={len(filtered_classes)}, name='{competence_name}', date='{report_date}'"
+        )
+
+        for idx, cls in enumerate(filtered_classes, start=1):
+            class_id = self._parse_int(cls.get('id'))
+            class_name = str(cls.get('name', 'Без названия'))
+            class_number = str(cls.get('number', '-'))
+            subject_name = self._extract_subject_name(cls)
+            prefix = f"[{idx}/{len(filtered_classes)}]"
+
+            self.logger.info(
+                f"{prefix} Обработка класса: id={class_id}, number='{class_number}', name='{class_name}', subject='{subject_name}'"
+            )
+
+            try:
+                if class_id is None:
+                    self.logger.warning(f"{prefix} Пропуск класса: невалидный class_id")
+                    stats["skipped"] += 1
+                    continue
+
+                stats["processed"] += 1
+
+                industries = self._get_industries_for_class(class_id)
+                if industries is None:
+                    self.logger.warning(f"{prefix} Пропуск класса {class_id}: не удалось получить industries")
+                    stats["errors"] += 1
+                    continue
+
+                industry_id = self._pick_industry_id_by_subject(industries, subject_name)
+                if industry_id is None:
+                    self.logger.warning(
+                        f"{prefix} Пропуск класса {class_id}: industry_id не найден для subject='{subject_name}'"
+                    )
+                    stats["skipped"] += 1
+                    continue
+
+                payload = {
+                    "date": report_date,
+                    "display_in_pdf": 0,
+                    "group_id": class_id,
+                    "group_type": 1,
+                    "index_in_pdf": 0,
+                    "industries": [industry_id],
+                    "name": competence_name,
+                    "type": 1,
+                }
+
+                post_url = f"{self.api_url}/{self.user_id}/plan/competence-reports"
+                self.logger.info(f"{prefix} POST competence-report для класса {class_id}: {post_url}")
+                self.logger.debug(f"{prefix} payload={json.dumps(payload, ensure_ascii=False)}")
+
+                response = self.session.post(post_url, data=json.dumps(payload), timeout=20)
+                response.raise_for_status()
+
+                response_payload: Any = None
+                try:
+                    response_payload = response.json()
+                except requests.exceptions.JSONDecodeError:
+                    self.logger.warning(f"{prefix} Ответ POST не JSON (status={response.status_code})")
+
+                created_report_id = None
+                if isinstance(response_payload, dict):
+                    created_report_id = response_payload.get('id')
+
+                self.logger.info(
+                    f"{prefix} Успех: создана компетенция для class_id={class_id}, industry_id={industry_id}, report_id={created_report_id}"
+                )
+                stats["created"] += 1
+            except requests.RequestException as e:
+                self.logger.error(f"{prefix} Ошибка HTTP для класса {class_id}: {e}")
+                stats["errors"] += 1
+            except Exception as e:
+                self.logger.error(f"{prefix} Непредвиденная ошибка для класса {class_id}: {e}")
+                stats["errors"] += 1
+
+        self.logger.info(
+            "Итог создания компетенций: "
+            f"total={stats['total']}, processed={stats['processed']}, created={stats['created']}, "
+            f"skipped={stats['skipped']}, errors={stats['errors']}"
+        )
+        return stats
+
+    def toggle_request_dumping(self) -> bool:
+        """Переключает режим автосохранения всех ответов API в файлы."""
+        self.save_all_responses_enabled = not self.save_all_responses_enabled
+        state = "включено" if self.save_all_responses_enabled else "выключено"
+        self.logger.info(f"Автосохранение ответов API {state}.")
+        if self.save_all_responses_enabled:
+            os.makedirs(RESPONSES_DIR, exist_ok=True)
+            self.logger.info(f"Каталог дампов ответов: {RESPONSES_DIR}")
+        return self.save_all_responses_enabled
+
+    def _build_response_dump_path(self, response: requests.Response, is_json: bool) -> str:
+        """Формирует путь к файлу дампа ответа API."""
+        request = response.request
+        request_url = request.url if request is not None and request.url else response.url
+        parsed = urlparse(request_url or "")
+        endpoint_for_name = parsed.path.strip('/') or "root"
+        if parsed.query:
+            endpoint_for_name = f"{endpoint_for_name}_q_{parsed.query}"
+
+        method = (request.method if request is not None and request.method else "GET").upper()
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        safe_name = self._sanitize_filename(endpoint_for_name)
+        self._response_dump_seq += 1
+        extension = ".json" if is_json else ".txt"
+        filename = (
+            f"{timestamp}_{self._response_dump_seq:04d}_{method}_{safe_name}_"
+            f"status_{response.status_code}{extension}"
+        )
+        return os.path.join(RESPONSES_DIR, filename)
+
+    def _dump_response_to_file(self, response: requests.Response) -> Optional[str]:
+        """Сохраняет текущий HTTP-ответ в JSON/TXT файл."""
+        os.makedirs(RESPONSES_DIR, exist_ok=True)
+        request = response.request
+        method = (request.method if request is not None and request.method else "GET").upper()
+        request_url = request.url if request is not None and request.url else response.url
+
+        try:
+            payload = response.json()
+            file_path = self._build_response_dump_path(response, is_json=True)
             with open(file_path, "w", encoding="utf-8") as json_file:
                 json.dump(payload, json_file, ensure_ascii=False, indent=2)
                 json_file.flush()
                 os.fsync(json_file.fileno())
-
-            self.logger.info(f"JSON-ответ сохранен: {file_path}")
-            return file_path
         except requests.exceptions.JSONDecodeError:
-            text_path = file_path.replace(".json", ".txt")
-            body = response.text if response is not None else ""
-            with open(text_path, "w", encoding="utf-8") as text_file:
-                text_file.write(body)
+            file_path = self._build_response_dump_path(response, is_json=False)
+            with open(file_path, "w", encoding="utf-8") as text_file:
+                text_file.write(response.text)
                 text_file.flush()
                 os.fsync(text_file.fileno())
-            self.logger.error(f"Ответ не JSON. Тело сохранено в: {text_path}")
-            return None
-        except requests.RequestException as e:
-            self.logger.error(f"Ошибка запроса {url}: {e}")
-            return None
+
+        self.logger.info(
+            f"Дамп ответа сохранен: {method} {request_url} -> {file_path}"
+        )
+        return file_path
+
+    def _response_dump_hook(self, response: requests.Response, *args: Any, **kwargs: Any) -> requests.Response:
+        """Hook requests.Session: сохраняет каждый ответ, если включен toggle."""
+        if not self.save_all_responses_enabled:
+            return response
+
+        try:
+            self._dump_response_to_file(response)
+        except Exception as e:
+            self.logger.error(f"Не удалось сохранить дамп ответа: {e}")
+        return response
 
     def _extract_full_name_from_member(self, member: Dict[str, Any]) -> str:
         """Извлекает ФИО из разных структур member/user в ответах API."""
@@ -440,7 +771,8 @@ class HumanUAAuth:
             class_id = cls.get('id')
             class_name = cls.get('name', 'Без названия')
             class_number = cls.get('number', '-')
-            print(f"ID: {class_id} | Класс: {class_number} | Название: {class_name}")
+            subject_name = self._extract_subject_name(cls)
+            print(f"ID: {class_id} | Класс: {class_number} | Название: {class_name} | Предмет: {subject_name}")
 
     def print_class_members(self, class_id: int, members: List[Dict[str, Any]]) -> None:
         """Печатает список участников выбранного класса."""
@@ -468,16 +800,18 @@ class HumanUAAuth:
             self.logger.error("Не удалось получить список классов. Экспорт невозможен.")
             return 0
 
-        if not classes_list:
-            self.logger.warning("Список классов пуст. Нечего экспортировать.")
+        filtered_classes = self._apply_selected_classes_filter(classes_list)
+
+        if not filtered_classes:
+            self.logger.warning("После применения фильтра классов список пуст. Нечего экспортировать.")
             return 0
 
         self.logger.info("\n--- Запуск экспорта участников классов ---")
         os.makedirs(EXPORT_DIR, exist_ok=True)
         self.logger.info(f"Каталог экспорта: {EXPORT_DIR}")
         total_exported_classes = 0
-        total_classes = len(classes_list)
-        for index, class_info in enumerate(classes_list, start=1):
+        total_classes = len(filtered_classes)
+        for index, class_info in enumerate(filtered_classes, start=1):
             class_id = class_info.get('id')
             class_name = class_info.get('name')
             class_number = class_info.get('number')
@@ -560,20 +894,23 @@ class HumanUAAuth:
         return total_exported_classes
 
 
-def print_menu() -> None:
+def print_menu(is_autosave_enabled: bool, selected_classes_status: str) -> None:
     print("\n=== Human.UA API Menu ===")
     print("1) Авторизоваться и инициализировать сессию")
-    print("2) Показать список классов")
-    print("3) Показать список участников класса")
-    print("4) Экспортировать всех учеников в CSV")
-    print("5) Сохранить JSON ответа по адресу")
+    autosave_state = "ВКЛЮЧЕНО" if is_autosave_enabled else "ВЫКЛЮЧЕНО"
+    print(f"2) Переключить автосохранение всех ответов API ({autosave_state})")
+    print("3) Показать список классов")
+    print(f"4) Выбрать классы для массовых операций ({selected_classes_status})")
+    print("5) Показать список участников класса")
+    print("6) Экспортировать всех учеников в CSV")
+    print("7) Создать компетенции")
     print("0) Выход")
 
 
 def run_cli_menu(auth_service: HumanUAAuth) -> None:
     initialized = False
     while True:
-        print_menu()
+        print_menu(auth_service.save_all_responses_enabled, auth_service.get_selected_classes_status())
         choice = input("Выберите действие: ").strip()
 
         if choice == "0":
@@ -593,18 +930,74 @@ def run_cli_menu(auth_service: HumanUAAuth) -> None:
                 print("Инициализация не удалась. Проверьте файл логов humanua_api.log")
             continue
 
+        if choice == "2":
+            enabled = auth_service.toggle_request_dumping()
+            state = "ВКЛЮЧЕНО" if enabled else "ВЫКЛЮЧЕНО"
+            print(f"Автосохранение ответов API: {state}")
+            if enabled:
+                print(f"Файлы сохраняются в: {RESPONSES_DIR}")
+            continue
+
         if not initialized:
             print("Сначала выполните пункт 1 (инициализация сессии).")
             continue
 
-        if choice == "2":
+        if choice == "3":
             classes = auth_service.get_all_classes()
             if classes is not None:
                 print(f"Получено классов: {len(classes)}")
                 auth_service.print_classes(classes)
             continue
 
-        if choice == "3":
+        if choice == "4":
+            classes = auth_service.get_all_classes()
+            if classes is None:
+                print("Не удалось получить список классов.")
+                continue
+            if not classes:
+                print("Список классов пуст.")
+                continue
+
+            print("\nТекущий список классов:")
+            auth_service.print_classes(classes)
+            print(
+                "\nВведите class_id через запятую (например: 1364654,1364700).\n"
+                "Пустой ввод или 'all' сбрасывает фильтр (будут использованы все классы)."
+            )
+            raw = input("Выбор классов: ").strip()
+
+            if not raw or raw.lower() == "all":
+                auth_service.set_selected_class_ids(None)
+                print("Фильтр классов сброшен. Используются все классы.")
+                continue
+
+            parts = [p.strip() for p in raw.split(',') if p.strip()]
+            candidate_ids: Set[int] = set()
+            invalid_parts: List[str] = []
+            for p in parts:
+                if p.isdigit():
+                    candidate_ids.add(int(p))
+                else:
+                    invalid_parts.append(p)
+
+            if invalid_parts:
+                print(f"Некорректные значения class_id: {', '.join(invalid_parts)}")
+                continue
+
+            existing_ids = {
+                int(cls_id) for cls_id in [cls.get('id') for cls in classes]
+                if isinstance(cls_id, int)
+            }
+            missing_ids = sorted([x for x in candidate_ids if x not in existing_ids])
+            if missing_ids:
+                print(f"Эти class_id не найдены в текущем списке классов: {', '.join(str(x) for x in missing_ids)}")
+                continue
+
+            auth_service.set_selected_class_ids(candidate_ids)
+            print(f"Выбрано классов: {len(candidate_ids)}")
+            continue
+
+        if choice == "5":
             classes = auth_service.get_all_classes()
             if classes is None:
                 print("Не удалось получить список классов.")
@@ -623,18 +1016,33 @@ def run_cli_menu(auth_service: HumanUAAuth) -> None:
                 auth_service.print_class_members(int(class_id_raw), members)
             continue
 
-        if choice == "4":
+        if choice == "6":
             exported = auth_service.export_all_members_to_csvs_new_logic()
             print(f"Экспорт завершён. Успешно обработано классов: {exported}")
             continue
 
-        if choice == "5":
-            endpoint_input = input("Введите URL или путь (например /600657/system/info): ").strip()
-            saved_file = auth_service.save_json_response(endpoint_input)
-            if saved_file:
-                print(f"JSON сохранен: {saved_file}")
-            else:
-                print("Не удалось сохранить JSON. Проверьте логи.")
+        if choice == "7":
+            competence_name = input("Введите название компетенции: ").strip()
+            if not competence_name:
+                print("Название компетенции не может быть пустым.")
+                continue
+
+            date_input = input("Введите дату (YYYY-MM-DD или YYYY-MM-DD HH:MM:SS): ").strip()
+            normalized_date = auth_service._normalize_report_date(date_input)
+            if normalized_date is None:
+                print("Некорректная дата. Пример: 2026-05-29 или 2026-05-29 00:00:00")
+                continue
+
+            print("Запускаю создание компетенций по всем классам. Подробности в логах...")
+            stats = auth_service.create_competences_for_all_classes(
+                competence_name=competence_name,
+                report_date=normalized_date,
+            )
+            print(
+                "Готово: "
+                f"total={stats['total']}, processed={stats['processed']}, created={stats['created']}, "
+                f"skipped={stats['skipped']}, errors={stats['errors']}"
+            )
             continue
 
         print("Неизвестная опция, попробуйте снова.")
