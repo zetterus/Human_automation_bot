@@ -878,6 +878,282 @@ class HumanUAAuth:
             self.logger.error(f"Не удалось сохранить отчет по проблемным ученикам: {e}")
             return None
 
+    def _save_failed_competence_students_report(self, failed_students: List[Dict[str, Any]]) -> Optional[str]:
+        """Сохраняет CSV-отчет по ученикам, у которых не удалось проставить компетенции полностью."""
+        if not failed_students:
+            return None
+
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        file_path = os.path.join(REPORTS_DIR, f"failed_competence_students_{timestamp}.csv")
+        fieldnames = [
+            "class_id",
+            "semester_number",
+            "competence_report_id",
+            "student_id",
+            "failed_posts",
+            "reasons",
+        ]
+
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in failed_students:
+                    writer.writerow(row)
+                csvfile.flush()
+                os.fsync(csvfile.fileno())
+            self.logger.info(f"Отчет по проблемным выставлениям компетенций сохранен: {file_path}")
+            return file_path
+        except Exception as e:
+            self.logger.error(f"Не удалось сохранить отчет по проблемным компетенциям: {e}")
+            return None
+
+    def _extract_result_group_scores_by_position(
+        self,
+        class_id: int,
+        student_id: int,
+        semester_number: int,
+    ) -> Dict[int, Dict[str, Any]]:
+        """Возвращает словарь по position: id/name/int_value из summative result-group для ученика."""
+        if self.user_id is None:
+            self.logger.error("user_id не установлен. Невозможно получить result-group для компетенций.")
+            return {}
+
+        url = (
+            f"{self.api_url}/{self.user_id}/plan/summative-assessment/result-group/"
+            f"{class_id}/semester/{semester_number}"
+        )
+        params = {"student_id": student_id}
+        self.logger.info(
+            f"Запрос result-group для компетенций: class_id={class_id}, student_id={student_id}, "
+            f"semester={semester_number}"
+        )
+
+        try:
+            response = self.session.get(url, params=params, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                self.logger.error(
+                    f"Некорректный формат ответа result-group для class_id={class_id}, student_id={student_id}: "
+                    f"{type(payload).__name__}"
+                )
+                return {}
+
+            by_position: Dict[int, Dict[str, Any]] = {}
+            result_groups_roots = payload.get("resultGroups")
+            if isinstance(result_groups_roots, list):
+                for root_item in result_groups_roots:
+                    if not isinstance(root_item, dict):
+                        continue
+                    inner_groups = root_item.get("resultGroups")
+                    if not isinstance(inner_groups, list):
+                        continue
+                    for group in inner_groups:
+                        if not isinstance(group, dict):
+                            continue
+                        position = self._parse_int(group.get("position"))
+                        result_group_id = self._parse_int(group.get("id"))
+                        result_group_name = str(group.get("name", "")).strip()
+                        if position is None or result_group_id is None:
+                            continue
+                        by_position[position] = {
+                            "result_group_id": result_group_id,
+                            "result_group_name": result_group_name,
+                            "result_group_int_value": None,
+                        }
+
+            assessment_values_by_result_group_id: Dict[int, int] = {}
+            assessments = payload.get("assessments")
+            if isinstance(assessments, list):
+                for item in assessments:
+                    if not isinstance(item, dict):
+                        continue
+                    result_group_id = self._parse_int(item.get("result_group_id"))
+                    assessment_obj = item.get("assessment")
+                    int_value = None
+                    if isinstance(assessment_obj, dict):
+                        int_value = self._round_score_to_int(assessment_obj.get("int_value"))
+                    if result_group_id is not None and int_value is not None:
+                        assessment_values_by_result_group_id[result_group_id] = int_value
+
+            for position, row in by_position.items():
+                result_group_id = self._parse_int(row.get("result_group_id"))
+                if result_group_id is None:
+                    continue
+                row["result_group_int_value"] = assessment_values_by_result_group_id.get(result_group_id)
+                self.logger.debug(
+                    f"position={position}: result_group_id={row.get('result_group_id')}, "
+                    f"name='{row.get('result_group_name')}', int_value={row.get('result_group_int_value')}"
+                )
+
+            return by_position
+        except requests.RequestException as e:
+            self.logger.error(
+                f"Ошибка запроса result-group для компетенций: class_id={class_id}, student_id={student_id}, error={e}"
+            )
+            return {}
+        except requests.exceptions.JSONDecodeError:
+            self.logger.error(
+                f"Ответ result-group для компетенций не JSON: class_id={class_id}, student_id={student_id}"
+            )
+            return {}
+
+    def _get_competence_report_id_for_class(self, class_id: int) -> Optional[int]:
+        """Возвращает competence_report_id для класса (по умолчанию второй элемент, иначе последний)."""
+        if self.user_id is None:
+            self.logger.error("user_id не установлен. Невозможно получить competence_report_id.")
+            return None
+
+        url = f"{self.api_url}/{self.user_id}/plan/competence-reports-course/{class_id}"
+        self.logger.info(f"Запрос competence-reports-course для class_id={class_id}: {url}")
+
+        try:
+            response = self.session.get(url, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list) or not payload:
+                self.logger.warning(f"class_id={class_id}: competence-reports-course пуст или не list")
+                return None
+
+            selected_item = payload[1] if len(payload) >= 2 else payload[-1]
+            competence_report_id = None
+            if isinstance(selected_item, dict):
+                competence_report_id = self._parse_int(selected_item.get("id"))
+
+            if competence_report_id is None:
+                self.logger.warning(f"class_id={class_id}: не удалось извлечь competence_report_id")
+                return None
+
+            self.logger.info(
+                f"class_id={class_id}: выбран competence_report_id={competence_report_id} (index={'1' if len(payload) >= 2 else 'last'})"
+            )
+            return competence_report_id
+        except requests.RequestException as e:
+            self.logger.error(f"Ошибка запроса competence-reports-course для class_id={class_id}: {e}")
+            return None
+        except requests.exceptions.JSONDecodeError:
+            self.logger.error(f"Ответ competence-reports-course для class_id={class_id} не JSON")
+            return None
+
+    def _extract_competence_ids_by_position(
+        self,
+        competence_report_id: int,
+        student_id: int,
+    ) -> Dict[int, int]:
+        """Возвращает соответствие position -> competence_id из industries[0].children[].competencies[]."""
+        if self.user_id is None:
+            self.logger.error("user_id не установлен. Невозможно получить competence_id по позициям.")
+            return {}
+
+        url = (
+            f"{self.api_url}/{self.user_id}/plan/competence-reports/"
+            f"{competence_report_id}/user/{student_id}/assessments"
+        )
+        self.logger.info(
+            f"Запрос competence assessments: competence_report_id={competence_report_id}, student_id={student_id}"
+        )
+
+        try:
+            response = self.session.get(url, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                self.logger.error(
+                    f"Некорректный формат competence assessments для student_id={student_id}: "
+                    f"{type(payload).__name__}"
+                )
+                return {}
+
+            position_to_competence_id: Dict[int, int] = {}
+            industries = payload.get("industries")
+            if isinstance(industries, list) and len(industries) > 0:
+                first_industry = industries[0]
+                if isinstance(first_industry, dict):
+                    children = first_industry.get("children")
+                    if isinstance(children, list):
+                        for child in children:
+                            if not isinstance(child, dict):
+                                continue
+                            competencies = child.get("competencies")
+                            if isinstance(competencies, list):
+                                for comp in competencies:
+                                    if not isinstance(comp, dict):
+                                        continue
+                                    competence_id = self._parse_int(comp.get("id"))
+                                    position = self._parse_int(comp.get("position"))
+                                    if competence_id is not None and position is not None:
+                                        position_to_competence_id[position] = competence_id
+                                        self.logger.debug(
+                                            f"student_id={student_id}: competence_id_{position}={competence_id}"
+                                        )
+
+            if not position_to_competence_id:
+                self.logger.warning(
+                    f"student_id={student_id}: competence_id по position не найдены в industries[0].children[].competencies[]"
+                )
+
+            self.logger.debug(
+                f"student_id={student_id}: итовое маппинг competence_id: {position_to_competence_id}"
+            )
+            return position_to_competence_id
+        except requests.RequestException as e:
+            self.logger.error(
+                f"Ошибка запроса competence assessments для student_id={student_id}, report={competence_report_id}: {e}"
+            )
+            return {}
+        except requests.exceptions.JSONDecodeError:
+            self.logger.error(
+                f"Ответ competence assessments не JSON для student_id={student_id}, report={competence_report_id}"
+            )
+            return {}
+
+    def _post_competence_assessment(
+        self,
+        competence_report_id: int,
+        student_id: int,
+        competence_id: int,
+        int_value: int,
+    ) -> bool:
+        """Отправляет POST оценки компетенции для ученика."""
+        if self.user_id is None:
+            self.logger.error("user_id не установлен. Невозможно отправить competence assessment.")
+            return False
+
+        endpoint_path = (
+            f"/{self.user_id}/plan/competence-reports/{competence_report_id}/user/{student_id}/assessments"
+        )
+        url = f"{self.api_url}{endpoint_path}"
+        payload = {
+            "competence_id": competence_id,
+            "endpoint": endpoint_path,
+            "grade": 3,
+            "int_value": int_value,
+            "is_final": 1,
+            "learner_id": student_id,
+            "type": 0,
+        }
+
+        self.logger.debug(
+            f"POST competence assessment: student_id={student_id}, report_id={competence_report_id}, "
+            f"competence_id={competence_id}, int_value={int_value}"
+        )
+        try:
+            response = self.session.post(url, data=json.dumps(payload), timeout=20)
+            response.raise_for_status()
+            self.logger.info(
+                f"Успех POST competence assessment: student_id={student_id}, competence_id={competence_id}, "
+                f"status={response.status_code}"
+            )
+            return True
+        except requests.RequestException as e:
+            self.logger.error(
+                f"Ошибка POST competence assessment: student_id={student_id}, competence_id={competence_id}, "
+                f"report_id={competence_report_id}, error={e}"
+            )
+            return False
+
     def set_result_groups_for_selected_classes(
         self,
         semester_number: int,
@@ -1130,6 +1406,235 @@ class HumanUAAuth:
         )
         return stats
 
+    def set_competence_assessments_for_selected_classes(
+        self,
+        semester_number: int = 2,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Проставляет оценки компетенций по данным суммативных result-group для учеников выбранных классов."""
+        stats = {
+            "total_classes": 0,
+            "processed_classes": 0,
+            "students_total": 0,
+            "students_processed": 0,
+            "students_with_failures": 0,
+            "posts_sent": 0,
+            "posts_failed": 0,
+            "posts_planned": 0,
+            "skipped_classes": 0,
+            "errors": 0,
+            "failed_students_report": None,
+            "semester_number": semester_number,
+        }
+
+        failed_students: List[Dict[str, Any]] = []
+
+        if self.user_id is None:
+            self.logger.error("user_id не установлен. Операция невозможна.")
+            stats["errors"] += 1
+            return stats
+
+        classes = self.get_all_classes()
+        if classes is None:
+            self.logger.error("Не удалось получить список классов для проставления компетенций.")
+            stats["errors"] += 1
+            return stats
+
+        filtered_classes = self._apply_selected_classes_filter(classes)
+        stats["total_classes"] = len(filtered_classes)
+        if not filtered_classes:
+            self.logger.warning("После применения фильтра классов список пуст. Нечего обрабатывать.")
+            return stats
+
+        self.logger.info(
+            f"Старт проставления компетенций: semester={semester_number}, classes={len(filtered_classes)}, dry_run={dry_run}"
+        )
+
+        for idx, cls in enumerate(filtered_classes, start=1):
+            class_id = self._parse_int(cls.get("id"))
+            class_name = str(cls.get("name", "Без названия"))
+            class_number = str(cls.get("number", "-"))
+            prefix = f"[{idx}/{len(filtered_classes)}]"
+
+            self.logger.info(
+                f"{prefix} Класс: id={class_id}, number='{class_number}', name='{class_name}', semester={semester_number}"
+            )
+
+            try:
+                if class_id is None:
+                    self.logger.warning(f"{prefix} Пропуск класса: невалидный class_id")
+                    stats["skipped_classes"] += 1
+                    continue
+
+                competence_report_id = self._get_competence_report_id_for_class(class_id)
+                if competence_report_id is None:
+                    self.logger.warning(f"{prefix} Пропуск класса {class_id}: не найден competence_report_id")
+                    stats["skipped_classes"] += 1
+                    continue
+
+                members = self.get_class_members(class_id)
+                if members is None:
+                    self.logger.warning(f"{prefix} Пропуск класса {class_id}: не удалось получить участников")
+                    stats["errors"] += 1
+                    continue
+
+                students: List[int] = []
+                for member in members:
+                    if not isinstance(member, dict):
+                        continue
+                    role_id = self._parse_int(member.get("group_role_id"))
+                    student_id = self._parse_int(member.get("user_id"))
+                    if role_id == 5 and student_id is not None:
+                        students.append(student_id)
+
+                unique_students = sorted(set(students))
+                self.logger.info(
+                    f"{prefix} class_id={class_id}: найдено учеников для обработки={len(unique_students)}"
+                )
+                stats["students_total"] += len(unique_students)
+                stats["processed_classes"] += 1
+
+                total_students_in_class = len(unique_students)
+                for student_index, student_id in enumerate(unique_students, start=1):
+                    student_prefix = f"{prefix} [{student_index}/{total_students_in_class}]"
+                    try:
+                        student_reasons: List[str] = []
+                        student_failed_posts = 0
+
+                        self.logger.info(
+                            f"{student_prefix} Обработка ученика student_id={student_id}, report_id={competence_report_id}"
+                        )
+
+                        result_group_rows = self._extract_result_group_scores_by_position(
+                            class_id=class_id,
+                            student_id=student_id,
+                            semester_number=semester_number,
+                        )
+                        if not result_group_rows:
+                            self.logger.warning(
+                                f"{student_prefix} student_id={student_id}: нет result-group данных для компетенций"
+                            )
+                            student_reasons.append("empty result-group payload")
+                            failed_students.append({
+                                "class_id": class_id,
+                                "semester_number": semester_number,
+                                "competence_report_id": competence_report_id,
+                                "student_id": student_id,
+                                "failed_posts": 0,
+                                "reasons": "; ".join(student_reasons),
+                            })
+                            stats["students_with_failures"] += 1
+                            continue
+
+                        competence_ids_by_position = self._extract_competence_ids_by_position(
+                            competence_report_id=competence_report_id,
+                            student_id=student_id,
+                        )
+                        if not competence_ids_by_position:
+                            self.logger.warning(
+                                f"{student_prefix} student_id={student_id}: не найдены competence_id по позициям"
+                            )
+                            student_reasons.append("empty competence_id mapping")
+                            failed_students.append({
+                                "class_id": class_id,
+                                "semester_number": semester_number,
+                                "competence_report_id": competence_report_id,
+                                "student_id": student_id,
+                                "failed_posts": 0,
+                                "reasons": "; ".join(student_reasons),
+                            })
+                            stats["students_with_failures"] += 1
+                            continue
+
+                        stats["students_processed"] += 1
+
+                        for position in sorted(result_group_rows.keys()):
+                            row = result_group_rows[position]
+                            competence_id = competence_ids_by_position.get(position)
+                            if competence_id is None:
+                                self.logger.warning(
+                                    f"{student_prefix} student_id={student_id}: нет competence_id для position={position}"
+                                )
+                                stats["posts_failed"] += 1
+                                student_failed_posts += 1
+                                student_reasons.append(f"missing competence_id position={position}")
+                                continue
+
+                            int_value = self._round_score_to_int(row.get("result_group_int_value"))
+                            if int_value is None:
+                                self.logger.warning(
+                                    f"{student_prefix} student_id={student_id}: нет int_value для position={position}"
+                                )
+                                stats["posts_failed"] += 1
+                                student_failed_posts += 1
+                                student_reasons.append(f"missing int_value position={position}")
+                                continue
+
+                            stats["posts_planned"] += 1
+                            if dry_run:
+                                self.logger.info(
+                                    f"{student_prefix} DRY-RUN competence POST: student_id={student_id}, "
+                                    f"position={position}, competence_id={competence_id}, int_value={int_value}"
+                                )
+                                continue
+
+                            ok = self._post_competence_assessment(
+                                competence_report_id=competence_report_id,
+                                student_id=student_id,
+                                competence_id=competence_id,
+                                int_value=int_value,
+                            )
+                            if ok:
+                                stats["posts_sent"] += 1
+                            else:
+                                stats["posts_failed"] += 1
+                                student_failed_posts += 1
+                                student_reasons.append(
+                                    f"POST failed competence_id={competence_id} position={position}"
+                                )
+
+                        if student_failed_posts > 0:
+                            failed_students.append({
+                                "class_id": class_id,
+                                "semester_number": semester_number,
+                                "competence_report_id": competence_report_id,
+                                "student_id": student_id,
+                                "failed_posts": student_failed_posts,
+                                "reasons": "; ".join(sorted(set(student_reasons))) if student_reasons else "unknown",
+                            })
+                            stats["students_with_failures"] += 1
+                    except Exception as e:
+                        self.logger.error(
+                            f"{student_prefix} Непредвиденная ошибка при обработке student_id={student_id}: {e}"
+                        )
+                        failed_students.append({
+                            "class_id": class_id,
+                            "semester_number": semester_number,
+                            "competence_report_id": competence_report_id,
+                            "student_id": student_id,
+                            "failed_posts": 0,
+                            "reasons": f"exception: {e}",
+                        })
+                        stats["students_with_failures"] += 1
+                        stats["errors"] += 1
+            except Exception as e:
+                self.logger.error(f"{prefix} Непредвиденная ошибка при обработке класса: {e}")
+                stats["errors"] += 1
+
+        report_path = self._save_failed_competence_students_report(failed_students)
+        stats["failed_students_report"] = report_path
+
+        self.logger.info(
+            "Итог проставления компетенций: "
+            f"total_classes={stats['total_classes']}, processed_classes={stats['processed_classes']}, "
+            f"students_total={stats['students_total']}, students_processed={stats['students_processed']}, "
+            f"students_with_failures={stats['students_with_failures']}, posts_planned={stats['posts_planned']}, "
+            f"posts_sent={stats['posts_sent']}, posts_failed={stats['posts_failed']}, "
+            f"skipped_classes={stats['skipped_classes']}, errors={stats['errors']}, "
+            f"semester_number={stats['semester_number']}, report={report_path}"
+        )
+        return stats
+
     def toggle_request_dumping(self) -> bool:
         """Переключает режим автосохранения всех ответов API в файлы."""
         self.save_all_responses_enabled = not self.save_all_responses_enabled
@@ -1356,6 +1861,7 @@ def print_menu(is_autosave_enabled: bool, selected_classes_status: str) -> None:
     print("6) Экспортировать всех учеников в CSV")
     print("7) Создать компетенции")
     print("8) Проставить группы результатов")
+    print("9) Выставить компетенции из групп результатов")
     print("0) Выход")
 
 
@@ -1535,6 +2041,39 @@ def run_cli_menu(auth_service: HumanUAAuth) -> None:
                 f"students_with_failures={stats['students_with_failures']}, "
                 f"posts_planned={stats['posts_planned']}, posts_ok={stats['posts_sent']}, posts_failed={stats['posts_failed']}, "
                 f"skipped_classes={stats['skipped_classes']}, errors={stats['errors']}, mode={stats['score_mode']}"
+            )
+            if stats.get("failed_students_report"):
+                print(f"Отчет по проблемным ученикам: {stats['failed_students_report']}")
+            continue
+
+        if choice == "9":
+            semester_raw = input("Выберите семестр для источника оценок (1 или 2) [2]: ").strip()
+            if semester_raw == "":
+                semester_number = 2
+            elif semester_raw in {"1", "2"}:
+                semester_number = int(semester_raw)
+            else:
+                print("Некорректный семестр. Доступно: 1 или 2.")
+                continue
+
+            dry_run_raw = input("Тестовый режим без отправки POST? (y/N): ").strip().lower()
+            dry_run = dry_run_raw in {"y", "yes", "д", "да"}
+
+            print(
+                f"Запускаю выставление компетенций из групп результатов для семестра {semester_number}. "
+                "Подробности в логах..."
+            )
+            stats = auth_service.set_competence_assessments_for_selected_classes(
+                semester_number=semester_number,
+                dry_run=dry_run,
+            )
+            print(
+                "Готово: "
+                f"classes={stats['processed_classes']}/{stats['total_classes']}, "
+                f"students={stats['students_processed']}/{stats['students_total']}, "
+                f"students_with_failures={stats['students_with_failures']}, "
+                f"posts_planned={stats['posts_planned']}, posts_ok={stats['posts_sent']}, posts_failed={stats['posts_failed']}, "
+                f"skipped_classes={stats['skipped_classes']}, errors={stats['errors']}, semester={stats['semester_number']}"
             )
             if stats.get("failed_students_report"):
                 print(f"Отчет по проблемным ученикам: {stats['failed_students_report']}")
