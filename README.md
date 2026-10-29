@@ -1,44 +1,43 @@
-CLI-утилита для Human.UA API.
+CLI utility for the Human.UA API.
 
-Позволяет:
-- авторизоваться в API;
-- получить и использовать `user_id` для API-запросов;
-- получить список классов;
-- получить участников конкретного класса;
-- экспортировать учеников всех классов в CSV;
-- создать компетенции по всем классам на основе названия предмета и найденных industries;
-- выбирать конкретные классы, к которым применяются массовые операции (экспорт/создание компетенций);
-- проставлять группы результатов для выбранных классов с выбором семестра (1/2) и режима оценки (`max`/`individual`);
-- включать/выключать автосохранение всех HTTP-ответов API в файлы.
+Features:
+- Authenticate with the API;
+- Retrieve and use a `user_id` for API requests;
+- Get a list of classes;
+- Retrieve students for a specific class;
+- Export students from all classes to CSV;
+- Create competencies for all classes based on subject names and identified industries;
+- Select specific classes for bulk operations (exporting data or creating competencies);
+- Assign result groups to selected classes, with options to specify the semester (1/2) and the grading mode (`max` or `individual`);
+- Enable/disable the automatic saving of all API HTTP responses to files.
 
-## Настройка
+## Configuration
 
-Перед запуском задайте переменные окружения:
+Before running the utility, set the following environment variables:
 
 - `HUMAN_UA_EMAIL`
 - `HUMAN_UA_PASSWORD`
 
-## Запуск
+## Execution
 
 ```powershell
 python app.py
 ```
 
-После запуска откроется интерактивное меню с опциями вызова API-функций.
+Once launched, an interactive menu will appear, offering various API-related functions.
 
-## Сохранение ответов API
+## Saving API Responses
 
-- В меню есть toggle-опция автосохранения ответов API.
-- Когда опция включена, каждый отправленный запрос сохраняет отдельный файл в папку `responses` рядом с `app.py`.
-- Когда опция выключена, файлы не создаются.
+- The menu includes a toggle option for automatically saving API responses.
+- When enabled, each request is saved as a separate file in the `responses` folder (located next to `app.py`).
+- When disabled, no files are created.
 
-## Экспорт CSV
+## CSV Export
 
-- CSV-файлы сохраняются в папку `exports` рядом с `app.py`.
-- Во время экспорта в консоль выводится прогресс и полный путь каждого сохраненного файла.
+- CSV files are saved to the `exports` folder (located next to `app.py`).
+- During the export process, the console displays progress and the full path to each saved file.
 
-## Отчет по проблемным ученикам
+## Report on Problematic Student Entries
 
-- При проставлении групп результатов формируется CSV в папке `reports`.
-- В отчете фиксируются `class_id`, `semestr_id`, `semester_number`, `student_id`, `mode`, `failed_posts`, `reasons`.
-
+- When assigning result groups, a CSV report is generated in the `reports` folder.
+- The report includes the following details: `class_id`, `semestr_id`, `semester_number`, `student_id`, `mode`, `failed_posts`, and `reasons`.
